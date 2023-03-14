@@ -6,6 +6,7 @@ import threading
 import math
 import os
 import random
+import struct
 import sys
 import time
 
@@ -23,6 +24,10 @@ class click_labal(QLabel):
 		# The previous mouse position, used for panning.
 		self.last_x = None
 		self.last_y = None
+		
+		# Mouse position
+		self.mouse_x = 0
+		self.mouse_y = 0
 	
 	# Gets the tile at the position passed in local coordinates
 	def get_tile(self, x, y):
@@ -60,25 +65,39 @@ class click_labal(QLabel):
 	def mouseReleaseEvent(self, e):
 		e.accept()
 		
+		parent = self.parentWidget()
+		
 		self.last_x = None
 		self.last_y = None
 		
-		# If released after dragging, don't do anything
-		if self.lock != None:
-			self.lock = None
-			return
+		# If placing, place the pattern.
+		if parent.cgol.is_placing:
+			# If left click, place
+			if e.button() == Qt.LeftButton:
+				x, y = self.get_tile(e.pos().x(), e.pos().y())
+				
+				parent.cgol.place_queued = (x, y, True)
+				parent.cgol.is_placing = False
+				
+			# If right-click, cancel
+			elif e.button() == Qt.RightButton:
+				parent.cgol.is_placing = False
 		
-		# If the user has released the left mouse button after holding it down for 
-		if e.button() == Qt.LeftButton and time.time() - self.click_timer < 0.4:
-			parent = self.parentWidget()
+		else:
+			# If released after dragging, don't do anything
+			if self.lock != None:
+				self.lock = None
+				return
 			
-			self.halt()
-			
-			# Get the relevant pixel
-			x, y = self.get_tile(e.pos().x(), e.pos().y())
-			
-			parent.cgol.flip(x, y)
-			parent.render_queued = True
+			# If the user has released the left mouse button after holding it down for 
+			if e.button() == Qt.LeftButton and time.time() - self.click_timer < 0.4:
+				self.halt()
+				
+				# Get the relevant pixel
+				x, y = self.get_tile(e.pos().x(), e.pos().y())
+				
+				parent.cgol.flip(x, y)
+				parent.render_queued = True
 		
 	# If the user drags the mouse while holding the left mouse button, set all pixels they move over to either one or off.
 	def mouseMoveEvent(self, e):
@@ -120,6 +139,11 @@ class click_labal(QLabel):
 			
 			self.last_x = x
 			self.last_y = y
+		
+		# Otherwise, set the saved mouse position
+		else:
+			self.mouse_x = e.pos().x()
+			self.mouse_y = e.pos().y()
 	
 	def wheelEvent(self, e):
 		e.accept()
@@ -292,7 +316,7 @@ class CGOL_Window(QMainWindow):
 		self.last_frame_time = time.time()
 		
 		# The minimum delay between frames in seconds
-		self.frame_delay = 0.6
+		self.frame_delay = 0.2
 		
 		# The time of the most recent render
 		self.last_render_time = time.time()
@@ -320,6 +344,7 @@ class CGOL_Window(QMainWindow):
 		self.label = click_labal(self)
 		self.label.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
 		self.setCentralWidget(self.label)
+		self.label.setMouseTracking(True)
 		
 		self.create_canvas()
 		
@@ -418,7 +443,7 @@ class CGOL_Window(QMainWindow):
 		else:
 			print("Saving to " + self.savename + "...")
 			
-			# TODO: Save the grid
+			cgol.save(self.savename)
 	
 	def save_as(self):
 		# Get the file to save as
@@ -454,7 +479,7 @@ class CGOL_Window(QMainWindow):
 		
 		print("Opening " + fn + "...")
 		
-		#TODO: Open a grid
+		cgol.open(fn)
 	
 	def toggle_play(self):
 		if self.play.text() == "Play":
@@ -503,8 +528,17 @@ class CGOL_grid:
 		# If true, the mainloop will resize the grid at the next opportunity
 		self.resize_queued = None
 		
+		# If true, the mainloop will place the currently loaded pattern at the next opportunity.
+		self.place_queued = None
+		
+		# If true, the user has opened a pattern file and is placing the pattern currently.
+		self.is_placing = False
+		
 		# If set to true, a new frame has been generated and the GUI should advance one step.
 		self.frame_ready = False
+		
+		# Stores patterns that are opened for writing to the grid.
+		self.pattern = None
 		
 		# The history of this grid
 		self.history = []
@@ -704,8 +738,8 @@ class CGOL_grid:
 			print("Aborting resize; resulting grid too small! (The limit is 4x4)")
 			return
 		
-		if self.width + left + right > 1024 or self.height + top + bottom > 1024:
-			print("Aborting resize; resulting grid too big! (The limit is 1024x1024)")
+		if self.width + left + right > 512 or self.height + top + bottom > 512:
+			print("Aborting resize; resulting grid too big! (The limit is 512x512)")
 			return
 		
 		# Modify columns
@@ -793,7 +827,7 @@ class CGOL_grid:
 		self.set_next_to_latest()
 		self.frame_ready = True
 		
-#		print("Randomized %d (%d, %d)" % (self.latest, *self.get_latest()))
+#		print("Cleared %d (%d, %d)" % (self.latest, *self.get_latest()))
 	
 	# Simulates one step into the next grid. Gets a copy of is_periodic so we can change it from another thread without affecting the render.
 	def step(self, window, is_periodic):
@@ -830,6 +864,9 @@ class CGOL_grid:
 							# Count the neighbors
 							if self.grids[s_ind][a % self.width][b % self.height] & s_mask:
 								neighbors+=1
+								
+								if neighbors > 3:
+									break
 					
 					# Apply CGoL rules
 					if neighbors < 2 or neighbors > 3 or (neighbors == 2 and not self.grids[s_ind][x][y] & s_mask):
@@ -845,6 +882,7 @@ class CGOL_grid:
 				# In between columns, check if we should abort
 				if not window.is_halting:
 					print("Halting simulation thread.")
+					window.is_halting = False
 					return
 				
 				for y in range(self.height):
@@ -860,6 +898,12 @@ class CGOL_grid:
 							# Count the neighbors
 							if self.grids[s_ind][a % self.width][b % self.height] & s_mask:
 								neighbors+=1
+								
+								if neighbors > 3:
+									break
+								
+						if neighbors > 3:
+							break
 					
 					# Apply CGoL rules
 					if neighbors < 2 or neighbors > 3 or (neighbors == 2 and not self.grids[s_ind][x][y] & s_mask):
@@ -872,7 +916,7 @@ class CGOL_grid:
 		self.set_next_to_latest()
 		self.frame_ready = True
 		
-#		print("Next ready at %d (%d, %d), generated from %d (%d, %d)" % (self.latest, d_ind, d_bit, self.current, s_ind, s_bit))
+		print("Next ready at %d (%d, %d), generated from %d (%d, %d)" % (self.latest, d_ind, d_bit, self.current, s_ind, s_bit))
 		
 	# Renders using the passed camera, to the passed QPixmap
 	def render(self, window, cam, elem):
@@ -880,7 +924,7 @@ class CGOL_grid:
 		
 		pix = elem.pixmap()
 		
-#		print("Rendering frame %d... (%d, %d)" % (self.current, ind, bit))
+		print("Rendering frame %d... (%d, %d)" % (self.current, ind, bit))
 		
 		rect = pix.rect()
 		w2 = rect.width() / 2 / cam.s
@@ -900,7 +944,7 @@ class CGOL_grid:
 		# Draw the grid background
 		grid_l = int(0 - cam.x * cam.s + rect.width() / 2)
 		grid_t = int(0 - cam.y * cam.s + rect.height() / 2)
-		painter.fillRect(grid_l, grid_t, cgol.width * cam.s, cgol.height * cam.s, QtGui.QColor.fromRgb(25, 25, 25))
+		painter.fillRect(grid_l, grid_t, int(cgol.width * cam.s), int(cgol.height * cam.s), QtGui.QColor.fromRgb(25, 25, 25))
 		
 		# Iterate over all the squares in this range
 		mask = 1 << bit
@@ -909,10 +953,156 @@ class CGOL_grid:
 				if self.grids[ind][x][y] & mask:
 					painter.fillRect(int((x - left) * cam.s), int((y - top) * cam.s), int(cam.s), int(cam.s), QtGui.QColor.fromRgb(230, 230, 230))
 		
+		# Render the preview
+		if self.is_placing:
+			pat_width = len(self.pattern)
+			pat_height = len(self.pattern[0])
+			
+			x = max(math.floor(left + window.label.mouse_x / int(cam.s)), 0)
+			y = max(math.floor(top + (window.label.mouse_y + 10) / int(cam.s)), 0)
+			print(x, y)
+			
+			for a in range(max(-x, 0), min(min(pat_width, self.width-x), math.ceil(right)-x)):
+				for b in range(max(-y, 0), min(min(pat_height, self.height-y), math.ceil(bottom))):
+					if self.pattern[a][b]:
+						painter.fillRect(int((x + a - left) * cam.s), int((y + b - top) * cam.s), int(cam.s), int(cam.s), QtGui.QColor.fromRgb(210, 230, 210))
+		
 		elem.update()
 		painter.end()
 		
 #		elem.setPixmap(pix)
+	
+	# Copy this frame into the next frame
+	def clone(self):
+		s_ind, s_bit = self.get_current()
+		d_ind, d_bit = self.get_target()
+		
+		s_mask = 1 << s_bit
+		d_mask = 1 << d_bit
+		
+		for x in range(self.width):
+			for y in range(self.height):
+				if self.get(x, y):
+					self.grids[d_ind][x][y] |= d_mask
+				else:
+					self.grids[d_ind][x][y] &= ~d_mask
+	
+	# Crops the pattern currently being displayed and saves it to a file.
+	def save(self, fn):
+		if os.name == "nt" and fn[0] == "/":
+			fn = fn[1:]
+		
+		# Find the bounding box of the current pattern
+		left = 0
+		for x in range(self.width):
+			has_bits = False
+			for y in range(self.height):
+				if self.get(x, y):
+					has_bits = True
+					left = x
+					break
+			
+			if has_bits:
+				break
+		
+		right = 0
+		for x in range(self.width-1, -1, -1):
+			has_bits = False
+			for y in range(self.height):
+				if self.get(x, y):
+					has_bits = True
+					right = x
+					break
+			
+			if has_bits:
+				break
+		
+		top = 0
+		for y in range(self.height):
+			has_bits = False
+			for x in range(self.width):
+				if self.get(x, y):
+					has_bits = True
+					top = y
+					break
+			
+			if has_bits:
+				break
+		
+		bottom = 0
+		for y in range(self.height-1, -1, -1):
+			has_bits = False
+			for x in range(self.width):
+				if self.get(x, y):
+					has_bits = True
+					bottom = y
+					break
+			
+			if has_bits:
+				break
+		
+		print("Saving (%d, %d) - (%d, %d)" % (left, top, right, bottom))
+		
+		with open(fn, "w") as fout:
+			fout.write(str(right - left + 1) + " ")
+			fout.write(str(bottom - top + 1) + " ")
+			
+			for y in range(top, bottom+1):
+				for x in range(left, right+1):
+					fout.write("1" if self.get(x, y) else "0")
+	
+	# Opens a file and stores the pattern in this program's
+	def open(self, fn):
+		if os.name == "nt" and fn[0] == "/":
+			fn = fn[1:]
+		
+		self.pattern = []
+		
+		with open(fn, "r") as fin:
+			# Get width and height
+			dat = fin.read().split(" ")
+			
+			try:
+				pat_width = int(dat[0])
+				pat_height = int(dat[1])
+				
+			except ValueError:
+				print("Aborting Open: Invalid File.")
+			
+			try:
+				for x in range(pat_width):
+					self.pattern.append([])
+					
+					for y in range(pat_height):
+						ind = y*pat_width + x
+						
+						self.pattern[x].append(1 if dat[2][ind] == "1"  else 0)
+				
+			except IndexError:
+				print("Aborting Open: Invalid File.")
+		
+		self.is_placing = True
+
+	# Place the opened pattern onto the next grid at the given position.
+	# If do_erase, this will overwrite live pixels in the grid with dead pixels in the pattern
+	def place(self, x, y, do_erase):
+		ind, bit = self.get_target()
+		mask = 1 << bit
+		
+		pat_width = len(self.pattern)
+		pat_height = len(self.pattern[0])
+		
+		self.clone()
+		
+		for a in range(max(-x, 0), min(pat_width, self.width-x)):
+			for b in range(max(-y, 0), min(pat_height, self.height-y)):
+				if self.pattern[a][b]:
+					self.grids[ind][x+a][y+b] |= mask
+				elif do_erase:
+					self.grids[ind][x+a][y+b] &= ~mask
+		
+		self.set_next_to_latest()
+		self.frame_ready = True
 
 # PyQt will call this as quickly as it can while the app is running.
 def mainloop():
@@ -933,6 +1123,10 @@ def mainloop():
 		cgol.frame_ready = False
 		window.render_queued = True
 	
+	# Always render while placing.
+	if cgol.is_placing:
+		window.render_queued = True
+	
 	# In between renders, check if a resize is queued
 	if (window.resize_queued is not None or cgol.resize_queued is not None) and not window.render_thread.is_alive() and not window.simulation_thread.is_alive():
 		resize = None
@@ -949,6 +1143,11 @@ def mainloop():
 		
 		window.resize_queued = None
 		cgol.resize_queued = None
+	
+	# While not simulating a frame, check if a place is queued.
+	if cgol.place_queued is not None and not window.simulation_thread.is_alive():
+		cgol.place(*cgol.place_queued)
+		cgol.place_queued = None
 	
 	# If a new frame isn't ready, check if the application is requesting a render.
 	# If changes have been made and enough time has passed since the previous render AND we are not already rendering, launch another render thread.
